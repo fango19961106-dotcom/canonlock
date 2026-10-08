@@ -1,4 +1,4 @@
-# canonlock 技術規格（v0.4 — 五條合約 + 兩輪紅隊加固）
+# canonlock 技術規格（v0.5 — 五條合約 + 三輪紅隊加固）
 
 > Self-hosted Postgres 寫入閘口。定位一句：Agent 可以提出一條寫入；閘口用 AST fail-closed 驗過；人只批呢一條 canonical statement；執行前再驗，用完即廢。庫密碼永不入 agent。
 
@@ -28,7 +28,16 @@
 2. **目標表以外嘅 RangeVar 直拒**——`UPDATE ... FROM other_table` 跨表 join
 3. **est_rows=0 時 limit=0**——之前 ROW_BUFFER=5 會喺估算 0 行時放走 5 行；而家寫 1 行都 rollback
 
-實測排除項（唔中，唔修）：`EXISTS(SELECT 1)` 恒真、`id=1 OR EXISTS(...)`、`NOT false`——現有常量求值層已涵蓋。
+實測排除項：`EXISTS(SELECT 1)` 恒真、`id=1 OR EXISTS(...)`、`NOT false`——現有常量求值層已涵蓋。
+
+## v0.5 紅隊第三輪（各有 regression test）
+
+1. **裸欄 WHERE 直拒**——`WHERE id` 係 truthy 語義唔係謂詞，SQLite 下等於全表更新
+2. **self-approval 直拒**——開單人 == 批核人即拒（propose 階段）
+3. **冒名批核直拒**——approve 必須係開單指定嘅人，唔啱即 reject 張單
+4. **audit hash chain**——每條 entry 綁上一條 hash；`verify_audit()` 檢測篡改/刪除/插入。鏈尾 hash 需要外部錨點先可以防重鑄
+
+實測排除項：`WHERE 'abc'` 字串常量——現有常量求值層已涵蓋。
 
 ## 行數綁定（合約三嘅精髓）
 
@@ -37,15 +46,15 @@ Demo 實測：批核時 `customer_id=1` 得 2 行；批核後資料膨脹到 52 
 
 ## 恒真偵測
 
-兩層：(a) WHERE 全句零 ColumnRef 且常量求值為真 → 拒；(b) OR 分支有恒真項（逐個 operand 常量求值）→ 拒。v0.3 起，零欄引用但含函數調用嘅表達式唔求值、直拒。
+三層：(a) WHERE 根節點係裸 ColumnRef → 拒（v0.5）；(b) 全句零 ColumnRef 且常量求值為真 → 拒；(c) OR 分支有恒真項（逐個 operand 常量求值）→ 拒。v0.3 起，零欄引用但含函數調用嘅表達式唔求值、直拒。
 
 ## 原型限制（下一步）
 
 - 執行層原型用 SQLite 示範；解析層已經係真 libpg_query。正式版換 psycopg + EXPLAIN，介面已預留（`_estimate_rows` 同 transaction 段）
-- 身份未接：正式版人用 OIDC（公司 IdP）、agent 用 OAuth client credentials / SPIFFE SVID
+- 身份未接真 IdP：v0.5 做咗「批核人綁定 + self-approval 拒絕」嘅機制層；正式版人用 OIDC、agent 用 OAuth client credentials / SPIFFE SVID
 - 批核通道係記憶體版；正式版接 Slack / 電郵
-- hash-chain audit：作為寫入批核嘅證明副產品加入
+- audit 已加 hash chain；正式版鏈尾 hash 要 export 去外部錨點（WORM storage / 對方系統）
 
 ## 驗證
 
-`pytest -v`：26 個測試全綠（15 個合約測試 + 6 個 v0.3 regression + 5 個 v0.4 regression）。`demo.py`：13 項場景全綠。
+`pytest -v`：30 個測試全綠（15 合約 + 6 v0.3 + 5 v0.4 + 4 v0.5 regression）。`demo.py`：13 項場景全綠。

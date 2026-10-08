@@ -8,12 +8,13 @@
 讀取唔入人批。執行層原型用 SQLite 示範（libpg_query 解析層係真 Postgres parser）；
 正式版換 psycopg，介面已預留。
 
-v0.3（MOA 紅隊加固，每項有 regression test）：
- - WITH/CTE 直拒（data-modifying CTE 可以喺頂層 UPDATE 入面藏 DELETE）
- - RETURNING 直拒（寫路徑唔准讀返資料，防外洩）
- - INSERT 必須明寫欄名（positional INSERT 繞過欄白名單）
- - INSERT 只收 VALUES（INSERT...SELECT 可以跨欄複製敏感資料）
- - 零欄引用但含函數調用嘅表達式直拒（random()/now() 令常量求值唔穩定）
+v0.3（MOA 紅隊第一輪）：WITH/CTE、RETURNING 直拒；INSERT 必須明寫欄名兼只收 VALUES；
+零欄引用含函數調用嘅表達式直拒（random()/now() 令常量求值唔穩定）。
+
+v0.4（MOA 紅隊第二輪）：寫語句內任何 SubLink（子查詢）直拒——SET/WHERE/VALUES 子查詢
+可以偷讀禁欄或跨表；目標表以外嘅 RangeVar 直拒（UPDATE...FROM 跨表 join）；
+est_rows=0 時行數上限收緊到 0。
+每項加固都有 regression test（26 個測試全綠）。
 """
 import hashlib, time, uuid, sqlite3
 from pglast import parse_sql, ast, visitors
@@ -57,6 +58,14 @@ class FuncFinder(visitors.Visitor):
 def funcrefs(node):
     v = FuncFinder(); v(node); return v.funcs
 
+class SubLinkFinder(visitors.Visitor):
+    def __init__(self): self.count = 0
+    def visit_SubLink(self, a, n): self.count += 1
+
+class TableFinder(visitors.Visitor):
+    def __init__(self): self.tables = set()
+    def visit_RangeVar(self, a, n): self.tables.add(n.relname)
+
 def const_true(expr, db):
     """零 ColumnRef 嘅 expression：用 DB 常量求值，true = 恒真。
     含函數調用（random()/now() 等非確定性）唔求值——視為唔穩定，交由 fail-closed 拒絕。"""
@@ -98,22 +107,36 @@ def write_signature(canon: str):
         return dict(op="RETURNING", table=tree.relation.relname, columns=[], where=None,
                     reject="RETURNING not allowed (write path must not read back data)")
     if isinstance(tree, ast.UpdateStmt):
-        return dict(op="UPDATE", table=tree.relation.relname,
-                    columns=[t.name for t in tree.targetList],
-                    where=tree.whereClause)
-    if isinstance(tree, ast.DeleteStmt):
-        return dict(op="DELETE", table=tree.relation.relname,
-                    columns=[], where=tree.whereClause)
-    if isinstance(tree, ast.InsertStmt):
+        sig = dict(op="UPDATE", table=tree.relation.relname,
+                   columns=[t.name for t in tree.targetList],
+                   where=tree.whereClause)
+    elif isinstance(tree, ast.DeleteStmt):
+        sig = dict(op="DELETE", table=tree.relation.relname,
+                   columns=[], where=tree.whereClause)
+    elif isinstance(tree, ast.InsertStmt):
         if not tree.cols:
             return dict(op="INSERT", table=tree.relation.relname, columns=[], where=None,
                         reject="INSERT must name its columns (positional INSERT bypasses column whitelist)")
         if not isinstance(tree.selectStmt, ast.SelectStmt) or tree.selectStmt.valuesLists is None:
             return dict(op="INSERT", table=tree.relation.relname, columns=[], where=None,
                         reject="INSERT ... SELECT not allowed (VALUES only)")
-        return dict(op="INSERT", table=tree.relation.relname,
-                    columns=[c.name for c in tree.cols], where=None)
-    return None
+        sig = dict(op="INSERT", table=tree.relation.relname,
+                   columns=[c.name for c in tree.cols], where=None)
+    else:
+        return None
+    # v0.4 fail-closed：子查詢同跨表引用直拒。
+    # SubLink 可以經 SET/WHERE/VALUES 子查詢偷讀禁欄（同表都中）；UPDATE...FROM 可以跨表 join。
+    s = SubLinkFinder(); s(tree)
+    if s.count:
+        sig.update(reject="subqueries not allowed in write statements "
+                          "(can read forbidden columns or other tables)")
+        return sig
+    t = TableFinder(); t(tree)
+    extra_tables = t.tables - {sig["table"]}
+    if extra_tables:
+        sig.update(reject=f"references tables {sorted(extra_tables)} beyond target "
+                          f"'{sig['table']}' (cross-table access denied)")
+    return sig
 
 # ---------- 政策 ----------
 class Policy:
@@ -224,7 +247,8 @@ class CanonLock:
             cur = self.db.execute("BEGIN")
             cur = self.db.execute(p["canon"])
             affected = cur.rowcount
-            limit = p["est_rows"] * self.ROW_TOLERANCE + self.ROW_BUFFER
+            # v0.4：估算 0 行時 limit 收緊到 0（之前 buffer 會放走 5 行）
+            limit = p["est_rows"] * self.ROW_TOLERANCE + (self.ROW_BUFFER if p["est_rows"] > 0 else 0)
             if affected > limit:
                 self.db.execute("ROLLBACK")
                 self._log(agent, sql, "deny",

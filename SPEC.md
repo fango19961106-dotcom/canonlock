@@ -1,4 +1,4 @@
-# canonlock 技術規格（v0.3 — 五條合約 + 紅隊加固）
+# canonlock 技術規格（v0.4 — 五條合約 + 兩輪紅隊加固）
 
 > Self-hosted Postgres 寫入閘口。定位一句：Agent 可以提出一條寫入；閘口用 AST fail-closed 驗過；人只批呢一條 canonical statement；執行前再驗，用完即廢。庫密碼永不入 agent。
 
@@ -14,19 +14,25 @@
 
 另：讀取唔入人批。
 
-## v0.3 紅隊加固（MOA 演練實測，各有 regression test）
+## v0.3 紅隊第一輪（各有 regression test）
 
-1. **WITH/CTE 直拒**——`WITH d AS (DELETE FROM orders RETURNING *) UPDATE ...`：頂層係 UPDATE，只睇頂層會漏 CTE 入面嘅寫入
-2. **RETURNING 直拒**——`UPDATE ... RETURNING internal_note`：將寫路徑變讀路徑，外洩禁讀欄
+1. **WITH/CTE 直拒**——data-modifying CTE 可以喺頂層 UPDATE 入面藏 DELETE
+2. **RETURNING 直拒**——寫路徑唔准讀返資料
 3. **INSERT 必須明寫欄名**——positional INSERT 令欄白名單失效
-4. **INSERT 只收 VALUES**——`INSERT ... SELECT` 可以將禁讀欄複製入白名單欄
-5. **非確定性函數直拒**——`random()`/`now()` 類令常量求值唔穩定（實測 20 次：14 放行 6 拒），零欄引用含函數調用即拒
+4. **INSERT 只收 VALUES**——INSERT...SELECT 跨欄複製敏感資料
+5. **非確定性函數直拒**——`random()` 令常量求值唔穩定（實測 20 次：14 放行 6 拒）
 
-已知刻意寬鬆項：est_rows=0 時 limit=5（ROW_BUFFER 設計取捨）。
+## v0.4 紅隊第二輪（各有 regression test）
+
+1. **寫語句內任何 SubLink 直拒**——SET 子查詢偷讀禁欄（同表都中）、WHERE/VALUES 子查詢跨表讀，一條規則封晒
+2. **目標表以外嘅 RangeVar 直拒**——`UPDATE ... FROM other_table` 跨表 join
+3. **est_rows=0 時 limit=0**——之前 ROW_BUFFER=5 會喺估算 0 行時放走 5 行；而家寫 1 行都 rollback
+
+實測排除項（唔中，唔修）：`EXISTS(SELECT 1)` 恒真、`id=1 OR EXISTS(...)`、`NOT false`——現有常量求值層已涵蓋。
 
 ## 行數綁定（合約三嘅精髓）
 
-開單時用同一 WHERE 跑 `COUNT(*)` 估算（正式版：EXPLAIN）。執行時喺 transaction 內：實際 affected > 估算 × 2 + 5 → **ROLLBACK + 告警**。
+開單時用同一 WHERE 跑 `COUNT(*)` 估算（正式版：EXPLAIN）。執行時喺 transaction 內：實際 affected > 估算 × 2 + 5（est=0 時為 0）→ **ROLLBACK + 告警**。
 Demo 實測：批核時 `customer_id=1` 得 2 行；批核後資料膨脹到 52 行 → 同一條語句照樣 rollback，資料庫零改動。
 
 ## 恒真偵測
@@ -42,4 +48,4 @@ Demo 實測：批核時 `customer_id=1` 得 2 行；批核後資料膨脹到 52 
 
 ## 驗證
 
-`pytest -v`：21 個測試全綠（15 個合約測試 + 6 個 v0.3 紅隊 regression）。`demo.py`：13 項場景全綠。
+`pytest -v`：26 個測試全綠（15 個合約測試 + 6 個 v0.3 regression + 5 個 v0.4 regression）。`demo.py`：13 項場景全綠。

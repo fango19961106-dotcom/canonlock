@@ -116,3 +116,33 @@ def test_normal_insert_still_works(gate):
     gate.approvals.approve(r["approval_id"], "alice")
     r2 = gate.execute("analyst-bot","INSERT INTO orders(status) VALUES ('pending')", r["approval_id"])
     assert r2["ok"]
+
+# --- v0.4 MOA 第二輪 regression：子查詢/跨表/est=0 ---
+def test_set_subquery_rejected(gate):
+    r = gate.propose_write("analyst-bot","alice",
+        "UPDATE orders SET status=(SELECT internal_note FROM orders WHERE id=2) WHERE id=1")
+    assert "subqueries not allowed" in r["error"]
+
+def test_where_subquery_other_table_rejected(gate):
+    r = gate.propose_write("analyst-bot","alice",
+        "UPDATE orders SET status='x' WHERE id IN (SELECT id FROM orders)")
+    assert "subqueries not allowed" in r["error"]
+
+def test_update_from_other_table_rejected(gate):
+    r = gate.propose_write("analyst-bot","alice",
+        "UPDATE orders SET status='x' FROM salaries WHERE orders.id=salaries.id")
+    assert "beyond target" in r["error"]
+
+def test_values_subquery_rejected(gate):
+    r = gate.propose_write("analyst-bot","alice",
+        "INSERT INTO orders(status) VALUES ((SELECT internal_note FROM orders WHERE id=1))")
+    assert "subqueries not allowed" in r["error"]
+
+def test_zero_estimate_allows_zero_rows(gate):
+    aid = approve(gate, "analyst-bot", "UPDATE orders SET status='z' WHERE customer_id=999")
+    db = sqlite3.connect(DB)
+    for _ in range(5):
+        db.execute("INSERT INTO orders(customer_id,amount,status) VALUES (999,1.0,'pending')")
+    db.commit(); db.close()
+    r = gate.execute("analyst-bot", "UPDATE orders SET status='z' WHERE customer_id=999", aid)
+    assert not r["ok"] and "rolled back" in r["error"]

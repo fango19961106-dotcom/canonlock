@@ -17,7 +17,7 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -v          # 21 個測試
+pytest -v          # 26 個測試
 python3 demo.py    # 場景演示
 ```
 
@@ -31,9 +31,7 @@ python3 demo.py    # 場景演示
 
 呢個擋嘅係「批核同執行之間世界變咗」嘅時間窗攻擊。
 
-## v0.3：MOA 紅隊加固（2026-10-08）
-
-一次多角度紅隊演練實測確認咗五個窿，全部已封，每個有 regression test：
+## v0.3：MOA 紅隊第一輪（2026-10-08）
 
 | 攻擊 | 例子 | 修法 |
 |---|---|---|
@@ -43,7 +41,19 @@ python3 demo.py    # 場景演示
 | RETURNING 外洩 | `UPDATE ... RETURNING internal_note` | 任何 RETURNING 直拒 |
 | 非確定性函數 | `WHERE id=1 OR random()>0.9`（實測 20 次：14 放行 6 拒） | 零欄引用含函數 → 直拒 |
 
-呢五個窿正正示範咗 pgwarden 點解行 database 層強制路線：AST 內容級檢查每加一條規則，攻擊面就換一個形態。
+## v0.4：MOA 紅隊第二輪（2026-10-09）
+
+| 攻擊 | 例子 | 修法 |
+|---|---|---|
+| SET 子查詢偷讀禁欄 | `SET status=(SELECT internal_note ...)` | 寫語句內任何子查詢直拒 |
+| WHERE 子查詢跨表 | `WHERE id IN (SELECT id FROM salaries)` | 同上 |
+| UPDATE...FROM 跨表 | `UPDATE orders ... FROM salaries` | 目標表以外嘅 RangeVar 直拒 |
+| VALUES 藏子查詢 | `VALUES ((SELECT internal_note ...))` | 子查詢規則涵蓋 INSERT |
+| est=0 行數缺口 | 估 0 行、批後插 5 行、照寫 5 行 | est=0 時 limit=0，寫 1 行都 rollback |
+
+實測排除項（唔中，唔修）：`EXISTS(SELECT 1)`、`id=1 OR EXISTS(...)`、`NOT false`——現有常量求值層已涵蓋。呢個係 MOA 嘅紀律：假設要經實測先算數。
+
+兩輪紅隊共同示範咗 pgwarden 點解行 database 層強制路線：AST 內容級檢查每加一條規則，攻擊面就換一個形態。
 
 ## 技術抉擇：點解唔用 pglast 嘅 fingerprint()
 

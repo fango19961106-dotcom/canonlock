@@ -1,0 +1,2 @@
+pglast>=6
+pytest>=8

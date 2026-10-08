@@ -17,7 +17,7 @@
 
 ```bash
 pip install -r requirements.txt
-pytest -v          # 15 個測試
+pytest -v          # 21 個測試
 python3 demo.py    # 場景演示
 ```
 
@@ -30,6 +30,20 @@ python3 demo.py    # 場景演示
 ```
 
 呢個擋嘅係「批核同執行之間世界變咗」嘅時間窗攻擊。
+
+## v0.3：MOA 紅隊加固（2026-10-08）
+
+一次多角度紅隊演練實測確認咗五個窿，全部已封，每個有 regression test：
+
+| 攻擊 | 例子 | 修法 |
+|---|---|---|
+| data-modifying CTE | `WITH d AS (DELETE FROM orders ...) UPDATE ...` | 任何 `WITH` 直拒 |
+| positional INSERT | `INSERT INTO orders VALUES (...)` | 必須明寫欄名 |
+| INSERT...SELECT 跨欄複製 | `INSERT INTO orders(status) SELECT internal_note ...` | 只收 VALUES |
+| RETURNING 外洩 | `UPDATE ... RETURNING internal_note` | 任何 RETURNING 直拒 |
+| 非確定性函數 | `WHERE id=1 OR random()>0.9`（實測 20 次：14 放行 6 拒） | 零欄引用含函數 → 直拒 |
+
+呢五個窿正正示範咗 pgwarden 點解行 database 層強制路線：AST 內容級檢查每加一條規則，攻擊面就換一個形態。
 
 ## 技術抉擇：點解唔用 pglast 嘅 fingerprint()
 

@@ -8,13 +8,11 @@
 讀取唔入人批。執行層原型用 SQLite 示範（libpg_query 解析層係真 Postgres parser）；
 正式版換 psycopg，介面已預留。
 
-v0.3（MOA 紅隊第一輪）：WITH/CTE、RETURNING 直拒；INSERT 必須明寫欄名兼只收 VALUES；
-零欄引用含函數調用嘅表達式直拒（random()/now() 令常量求值唔穩定）。
-
-v0.4（MOA 紅隊第二輪）：寫語句內任何 SubLink（子查詢）直拒——SET/WHERE/VALUES 子查詢
-可以偷讀禁欄或跨表；目標表以外嘅 RangeVar 直拒（UPDATE...FROM 跨表 join）；
-est_rows=0 時行數上限收緊到 0。
-每項加固都有 regression test（26 個測試全綠）。
+v0.3：WITH/CTE、RETURNING 直拒；INSERT 必須明寫欄名兼只收 VALUES；
+零欄引用含函數調用嘅表達式直拒（random()/now()）。
+v0.4：寫語句內任何 SubLink 直拒；目標表以外嘅 RangeVar 直拒；est_rows=0 時 limit=0。
+v0.5：裸欄 WHERE（truthy 語義）直拒；self-approval 同冒名批核直拒；audit hash chain + verify_audit()。
+每項加固都有 regression test（30 個測試全綠）。
 """
 import hashlib, time, uuid, sqlite3
 from pglast import parse_sql, ast, visitors
@@ -80,7 +78,11 @@ def const_true(expr, db):
         return False  # 求值唔到唔代表恒真，交返其他檢查
 
 def is_tautology(where, db):
-    """恒真偵測：(a) 全句冇欄引用且求值為真；(b) OR 分支有恒真項"""
+    """恒真偵測：(a) 全句冇欄引用且求值為真；(b) OR 分支有恒真項。
+    v0.5：WHERE 根節點必須係謂詞（比較/布爾/NullTest/BooleanTest/FuncCall），
+    裸 ColumnRef（WHERE id 之類 truthy 語義）直拒。"""
+    if isinstance(where, ast.ColumnRef):
+        return True, "bare column WHERE is truthy semantics, not a predicate (fail-closed)"
     if colrefs(where) == 0:
         ct = const_true(where, db)
         if ct == "volatile":
@@ -179,9 +181,17 @@ class Approvals:
         return aid
 
     def approve(self, aid, human, ok=True):
+        """v0.5：批核人必須係開單指定嘅人，而且唔可以係 agent 自己（self-approval 直拒）。"""
         p = self.store[aid]
+        if human != p["human"]:
+            p["status"] = "rejected"
+            return False, f"approval must come from '{p['human']}', not '{human}'"
+        if human == p["agent"]:
+            p["status"] = "rejected"
+            return False, "self-approval is forbidden (requester cannot approve)"
         p["status"] = "approved" if ok else "rejected"
         p["approved_by"] = human   # 合約三：綁批核人
+        return True, None
 
     def redeem(self, aid, agent, chash):
         p = self.store.get(aid)
@@ -206,8 +216,26 @@ class CanonLock:
         self.audit = []
 
     def _log(self, agent, sql, decision, reason, aid=None):
-        self.audit.append(dict(ts=time.time(), agent=agent, sql=sql,
-                               decision=decision, reason=reason, approval=aid))
+        """v0.5：hash-chain audit——每條 entry 綁上一條嘅 hash，改任何一條即成條鏈唔啱。"""
+        entry = dict(ts=time.time(), agent=agent, sql=sql,
+                     decision=decision, reason=reason, approval=aid)
+        prev = self.audit[-1]["hash"] if self.audit else "0" * 64
+        entry["hash"] = hashlib.sha256(
+            (prev + repr(sorted(entry.items()))).encode()).hexdigest()
+        self.audit.append(entry)
+
+    def verify_audit(self):
+        """回傳 (ok, 壞咗嘅位置)。任何篡改、刪除、插入都會斷鏈。
+        鏈尾 hash 應該定期 export 去外部——唔係攻擊者可以連鏈一齊重鑄。"""
+        prev = "0" * 64
+        for i, e in enumerate(self.audit):
+            expect = hashlib.sha256(
+                (prev + repr(sorted({k: v for k, v in e.items() if k != "hash"}.items()))).encode()
+            ).hexdigest()
+            if e["hash"] != expect:
+                return False, i
+            prev = e["hash"]
+        return True, None
 
     def _estimate_rows(self, sig):
         """用同一 WHERE 跑 COUNT 估算（原型：SQLite；正式版：EXPLAIN）"""
@@ -221,6 +249,9 @@ class CanonLock:
             return 0
 
     def propose_write(self, agent, human, sql):
+        if human == agent:
+            self._log(agent, sql, "deny", "requester and approver cannot be the same identity")
+            return {"ok": False, "error": "DENIED: requester and approver cannot be the same identity"}
         canon, chash, err = canonicalize(sql)
         if err:
             self._log(agent, sql, "deny", err); return {"ok": False, "error": f"DENIED: {err}"}
